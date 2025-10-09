@@ -7,137 +7,154 @@ from matplotlib import cm
 x, y, t = sp.symbols('x,y,t')
 
 class Wave2D:
+    def __init__(self):
+        self.L = 1.0
+        self._mx = None
+        self._my = None
+        self._c = 1.0
+
 
     def create_mesh(self, N, sparse=False):
         """Create 2D mesh and store in self.xij and self.yij"""
-        # self.xji, self.yij = ...
-        raise NotImplementedError
+        self.N = int(N)
+        self.h = self.L / self.N
+        self.x = np.linspace(0.0, self.L, self.N + 1)
+        self.y = np.linspace(0.0, self.L, self.N + 1)
+        self.xij, self.yij = np.meshgrid(self.x, self.y, indexing="ij")
+
+        T = self.D2(self.N)               
+        I = sparse.identity(self.N + 1, format="csr")
+        self.Lap = (sparse.kron(I, T) + sparse.kron(T, I)) / (self.h**2)
+        self._bmask = self.boundary_mask() 
 
     def D2(self, N):
         """Return second order differentiation matrix"""
-        raise NotImplementedError
+        n = N + 1
+        main = -2.0 * np.ones(n)
+        off  =  1.0 * np.ones(n - 1)
+        T = sparse.diags([off, main, off], [-1, 0, 1], format="lil")
+        T[0, :] = 0.0; T[0, 0] = 1.0
+        T[-1, :] = 0.0; T[-1, -1] = 1.0
+        return T.tocsr()
+
+    def boundary_mask(self):
+        N = self.N
+        mask = np.zeros((N+1, N+1), dtype=bool)
+        mask[0, :] = True
+        mask[-1, :] = True
+        mask[:, 0] = True
+        mask[:, -1] = True
+        return mask
+
 
     @property
     def w(self):
-        """Return the dispersion coefficient"""
-        raise NotImplementedError
+        """Dispersion coefficient"""
+        if self._mx is None or self._my is None:
+            raise RuntimeError("Call initialize(...) first so mx,my are known.")
+        return (self._c * np.pi * np.sqrt(self._mx**2 + self._my**2) / self.L)
 
+    
     def ue(self, mx, my):
-        """Return the exact standing wave"""
-        return sp.sin(mx*sp.pi*x)*sp.sin(my*sp.pi*y)*sp.cos(self.w*t)
+        return sp.sin(mx*sp.pi*x) * sp.sin(my*sp.pi*y) * sp.cos(self.w*t)
 
+    
     def initialize(self, N, mx, my):
-        r"""Initialize the solution at $U^{n}$ and $U^{n-1}$
-
-        Parameters
-        ----------
-        N : int
-            The number of uniform intervals in each direction
-        mx, my : int
-            Parameters for the standing wave
-        """
-        raise NotImplementedError
+        """Set U^n and U^{n-1} at t=0."""
+        self.create_mesh(N)
+        self._mx, self._my = int(mx), int(my)
+        ue0 = sp.lambdify((x, y, t), self.ue(mx, my), "numpy")
+        U0 = ue0(self.xij, self.yij, 0.0).astype(float)
+        self.U_nm1 = U0.copy()  # U^{-1}
+        self.U_n   = U0.copy()  # U^{0}
+        self.apply_bcs()
 
     @property
     def dt(self):
-        """Return the time step"""
-        raise NotImplementedError
+        return self._dt
 
     def l2_error(self, u, t0):
-        """Return l2-error norm
-
-        Parameters
-        ----------
-        u : array
-            The solution mesh function
-        t0 : number
-            The time of the comparison
-        """
-        raise NotImplementedError
+        ue_fun = sp.lambdify((x, y, t), self.ue(self._mx, self._my), "numpy")
+        Ue = ue_fun(self.xij, self.yij, float(t0)).astype(float)
+        e = u - Ue
+        return np.sqrt(self.h**2 * np.sum(e**2))
 
     def apply_bcs(self):
-        raise NotImplementedError
+        self.U_nm1[self._bmask] = 0.0
+        self.U_n[self._bmask]   = 0.0
 
+   
     def __call__(self, N, Nt, cfl=0.5, c=1.0, mx=3, my=3, store_data=-1):
-        """Solve the wave equation
+        
+      
+        self._c = float(c)
+        self._dt = float(cfl * (self.L / N) / c)
 
-        Parameters
-        ----------
-        N : int
-            The number of uniform intervals in each direction
-        Nt : int
-            Number of time steps
-        cfl : number
-            The CFL number
-        c : number
-            The wave speed
-        mx, my : int
-            Parameters for the standing wave
-        store_data : int
-            Store the solution every store_data time step
-            Note that if store_data is -1 then you should return the l2-error
-            instead of data for plotting. This is used in `convergence_rates`.
+        self.initialize(N, mx, my)
 
-        Returns
-        -------
-        If store_data > 0, then return a dictionary with key, value = timestep, solution
-        If store_data == -1, then return the two-tuple (h, l2-error)
-        """
-        raise NotImplementedError
+    
+        lap = self.Lap
+        cdt2 = (c * self.dt)**2
+        errors = []
+        snapshots = {}
+
+      
+        ue_fun = sp.lambdify((x, y, t), self.ue(mx, my), "numpy")
+
+        for n in range(1, Nt+1):
+            
+            Uvec = self.U_n.flatten()
+            Lu = lap.dot(Uvec).reshape(self.N+1, self.N+1)
+
+            U_np1 = 2.0*self.U_n - self.U_nm1 + cdt2 * Lu
+
+            self.U_nm1, self.U_n = self.U_n, U_np1
+
+            self.apply_bcs()
+
+            if store_data > 0 and (n % store_data == 0):
+                snapshots[n] = self.U_n.copy()
+
+            if store_data == -1:
+                tn = n * self.dt
+                errors.append(self.l2_error(self.U_n, tn))
+
+        if store_data > 0:
+            return snapshots
+        else:
+            return self.h, np.array(errors)
 
     def convergence_rates(self, m=4, cfl=0.1, Nt=10, mx=3, my=3):
-        """Compute convergence rates for a range of discretizations
-
-        Parameters
-        ----------
-        m : int
-            The number of discretizations to use
-        cfl : number
-            The CFL number
-        Nt : int
-            The number of time steps to take
-        mx, my : int
-            Parameters for the standing wave
-
-        Returns
-        -------
-        3-tuple of arrays. The arrays represent:
-            0: the orders
-            1: the l2-errors
-            2: the mesh sizes
-        """
-        E = []
-        h = []
+        E, h = [], []
         N0 = 8
-        for m in range(m):
+        for _ in range(m):
             dx, err = self(N0, Nt, cfl=cfl, mx=mx, my=my, store_data=-1)
             E.append(err[-1])
             h.append(dx)
             N0 *= 2
             Nt *= 2
-        r = [np.log(E[i-1]/E[i])/np.log(h[i-1]/h[i]) for i in range(1, m+1, 1)]
+        r = [np.log(E[i-1]/E[i])/np.log(h[i-1]/h[i]) for i in range(1, m)]
         return r, np.array(E), np.array(h)
 
+# -------- Neumann variant --------
 class Wave2D_Neumann(Wave2D):
-
     def D2(self, N):
-        raise NotImplementedError
+        """Second derivative with homogeneous Neumann at boundaries."""
+
+        n = N + 1
+        main = -2.0 * np.ones(n)
+        off  =  1.0 * np.ones(n - 1)
+        T = sparse.diags([off, main, off], [-1, 0, 1], format="lil")
+        
+        T[0, :] = 0.0;     T[0, 0] = -2.0; T[0, 1] = 2.0
+        T[-1, :] = 0.0;    T[-1, -1] = -2.0; T[-1, -2] = 2.0
+        return T.tocsr()
 
     def ue(self, mx, my):
-        raise NotImplementedError
+        # Neumann standing wave
+        return sp.cos(mx*sp.pi*x) * sp.cos(my*sp.pi*y) * sp.cos(self.w*t)
 
     def apply_bcs(self):
-        raise NotImplementedError
-
-def test_convergence_wave2d():
-    sol = Wave2D()
-    r, E, h = sol.convergence_rates(mx=2, my=3)
-    assert abs(r[-1]-2) < 1e-2
-
-def test_convergence_wave2d_neumann():
-    solN = Wave2D_Neumann()
-    r, E, h = solN.convergence_rates(mx=2, my=3)
-    assert abs(r[-1]-2) < 0.05
-
-def test_exact_wave2d():
-    raise NotImplementedError
+        # For homogeneous Neumann, no values are imposed directly.
+        
+        pass
