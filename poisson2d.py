@@ -9,7 +9,7 @@ class Poisson2D:
 
         \nabla^2 u(x, y) = f(x, y), in [0, L]^2
 
-    where L is the length of the domain in both x and y directions.
+    where L is the length of the domain  in both x and y directions.
     Dirichlet boundary  conditions are used for the entire boundary.
     The Dirichlet values depend on the chosen manufactured solution.
     """
