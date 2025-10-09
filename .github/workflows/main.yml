@@ -26,4 +26,4 @@ jobs:
         pip install pytest numpy sympy matplotlib scipy
     - name: Test with pytest
       run: |
-        pytest -q tests
+        pytest *.py
