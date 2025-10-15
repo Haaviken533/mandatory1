@@ -132,3 +132,17 @@ class Poisson2D:
         u11 = self.U[i + 1, j + 1]
 
         return (1-tx)*(1-ty)*u00 + tx*(1-ty)*u10 + (1-tx)*ty*u01 + tx*ty*u11
+
+def test_convergence_poisson2d():
+    # This exact solution is NOT zero on the entire boundary
+    ue = sp.exp(sp.cos(4*sp.pi*x)*sp.sin(2*sp.pi*y))
+    sol = Poisson2D(1, ue)
+    r, E, h = sol.convergence_rates()
+    assert abs(r[-1]-2) < 1e-2
+
+def test_interpolation():
+    ue = sp.exp(sp.cos(4*sp.pi*x)*sp.sin(2*sp.pi*y))
+    sol = Poisson2D(1, ue)
+    U = sol(100)
+    assert abs(sol.eval(0.52, 0.63) - ue.subs({x: 0.52, y: 0.63}).n()) < 1e-3
+    assert abs(sol.eval(sol.h/2, 1-sol.h/2) - ue.subs({x: sol.h/2, y: 1-sol.h/2}).n()) < 1e-3
