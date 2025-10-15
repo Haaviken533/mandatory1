@@ -4,157 +4,219 @@ import scipy.sparse as sparse
 import matplotlib.pyplot as plt
 from matplotlib import cm
 
-x, y, t = sp.symbols('x,y,t')
+# Symbolic variables for the manufactured solution
+x, y, t = sp.symbols('x, y, t')
+
 
 class Wave2D:
-    def __init__(self):
-        self.L = 1.0
-        self._mx = None
-        self._my = None
-        self._c = 1.0
+    """2D wave equation solver with a manufactured standing-wave solution."""
+
+ 
+    # Grid & discrete operators
+
+    def build_grid(self, N: int, use_sparse_mesh: bool = False) -> None:
+        """Create a uniform [0,1]x[0,1] grid with N intervals per axis."""
+        self.N = N
+        self.h = 1.0 / N
+        self.x_nodes = np.linspace(0.0, 1.0, N + 1)
+        self.y_nodes = np.linspace(0.0, 1.0, N + 1)
+        self.X, self.Y = np.meshgrid(
+            self.x_nodes, self.y_nodes, indexing="ij", sparse=use_sparse_mesh
+        )
+
+    def second_diff_matrix(self, N: int) -> sparse.spmatrix:
+        """Centered second-derivative matrix ."""
+        main = -2.0 * np.ones(N + 1)
+        off = 1.0 * np.ones(N)
+        D = sparse.diags([off, main, off], offsets=[-1, 0, 1],
+                         shape=(N + 1, N + 1), format="lil")
+        return D
 
 
-    def create_mesh(self, N, sparse=False):
-        """Create 2D mesh and store in self.xij and self.yij"""
-        self.N = int(N)
-        self.h = self.L / self.N
-        self.x = np.linspace(0.0, self.L, self.N + 1)
-        self.y = np.linspace(0.0, self.L, self.N + 1)
-        self.xij, self.yij = np.meshgrid(self.x, self.y, indexing="ij")
-
-        T = self.D2(self.N)               
-        I = sparse.identity(self.N + 1, format="csr")
-        self.Lap = (sparse.kron(I, T) + sparse.kron(T, I)) / (self.h**2)
-        self._bmask = self.boundary_mask() 
-
-    def D2(self, N):
-        """Return second order differentiation matrix"""
-        n = N + 1
-        main = -2.0 * np.ones(n)
-        off  =  1.0 * np.ones(n - 1)
-        T = sparse.diags([off, main, off], [-1, 0, 1], format="lil")
-        T[0, :] = 0.0; T[0, 0] = 1.0
-        T[-1, :] = 0.0; T[-1, -1] = 1.0
-        return T.tocsr()
-
-    def boundary_mask(self):
-        N = self.N
-        mask = np.zeros((N+1, N+1), dtype=bool)
-        mask[0, :] = True
-        mask[-1, :] = True
-        mask[:, 0] = True
-        mask[:, -1] = True
-        return mask
-
-
+    # Exact (manufactured) solution
+    
     @property
-    def w(self):
-        """Dispersion coefficient"""
-        if self._mx is None or self._my is None:
-            raise RuntimeError("Call initialize(...) first so mx,my are known.")
-        return (self._c * np.pi * np.sqrt(self._mx**2 + self._my**2) / self.L)
+    def omega(self) -> float:
+        """Dispersion relation ω = c * sqrt((m_x π)^2 + (m_y π)^2)."""
+        kx = self.m_x * np.pi
+        ky = self.m_y * np.pi
+        return self.c * np.sqrt(kx**2 + ky**2)
 
-    
-    def ue(self, mx, my):
-        return sp.sin(mx*sp.pi*x) * sp.sin(my*sp.pi*y) * sp.cos(self.w*t)
+    def exact_mode(self, m_x: int, m_y: int) -> sp.Expr:
+        """Exact standing wave for Dirichlet boundaries."""
+        return sp.sin(m_x * sp.pi * x) * sp.sin(m_y * sp.pi * y) * sp.cos(self.omega * t)
 
-    
-    def initialize(self, N, mx, my):
-        """Set U^n and U^{n-1} at t=0."""
-        self.create_mesh(N)
-        self._mx, self._my = int(mx), int(my)
-        ue0 = sp.lambdify((x, y, t), self.ue(mx, my), "numpy")
-        U0 = ue0(self.xij, self.yij, 0.0).astype(float)
-        self.U_nm1 = U0.copy()  # U^{-1}
-        self.U_n   = U0.copy()  # U^{0}
+   
+    # Initialization & utilities
+  
+    def _initialize_state(self, N: int, m_x: int, m_y: int) -> None:
+        """Initialize U^{n}, U^{n-1} using the exact solution and a Taylor step."""
+        self.N = N
+        self.m_x = m_x
+        self.m_y = m_y
+
+        # Operators & grid
+        self.D = self.second_diff_matrix(N)
+        D = self.D
+        self.build_grid(N, use_sparse_mesh=False)
+
+        # Exact solution (symbolic -> numeric)
+        self.uex = self.exact_mode(m_x, m_y)
+        ue_fun = sp.lambdify((t, x, y), self.uex, "numpy")
+
+        # Allocate timestep states
+        self.u_next, self.u_now, self.u_prev = np.zeros((3, N + 1, N + 1))
+
+        # t = 0 displacement (and velocity = 0 for standing wave)
+        self.u_prev[:] = ue_fun(0.0, self.X, self.Y)
+        self.u_now[:] = self.u_prev
+        self.apply_bcs()
+
+        # One Taylor step to get U^1
+        self.u_prev[:] = self.u_now
+        lap_u_prev = (D @ self.u_prev + self.u_prev @ D.T) / (self.h**2)
+        self.u_now[:] = self.u_prev + 0.5 * (self.c * self.dt)**2 * lap_u_prev
         self.apply_bcs()
 
     @property
-    def dt(self):
-        return self._dt
+    def dt(self) -> float:
+        """Time step from CFL condition."""
+        return self.cfl * self.h / self.c
 
-    def l2_error(self, u, t0):
-        ue_fun = sp.lambdify((x, y, t), self.ue(self._mx, self._my), "numpy")
-        Ue = ue_fun(self.xij, self.yij, float(t0)).astype(float)
-        e = u - Ue
-        return np.sqrt(self.h**2 * np.sum(e**2))
+    def l2_error(self, U: np.ndarray, t_eval: float) -> float:
+        """Grid L2 error at a given time."""
+        ue_fun = sp.lambdify((t, x, y), self.uex, "numpy")
+        Ue = ue_fun(t_eval, self.X, self.Y)
+        diff = (U - Ue).ravel()
+        return self.h * np.linalg.norm(diff, 2)
 
-    def apply_bcs(self):
-        self.U_nm1[self._bmask] = 0.0
-        self.U_n[self._bmask]   = 0.0
+    def apply_bcs(self) -> None:
+        """Homogeneous Dirichlet BCs on all boundaries."""
+        U = self.u_now
+        U[0, :] = 0.0
+        U[-1, :] = 0.0
+        U[:, 0] = 0.0
+        U[:, -1] = 0.0
 
-   
-    def __call__(self, N, Nt, cfl=0.5, c=1.0, mx=3, my=3, store_data=-1):
-        
-      
-        self._c = float(c)
-        self._dt = float(cfl * (self.L / N) / c)
 
-        self.initialize(N, mx, my)
+    # Main solver entry point
 
-    
-        lap = self.Lap
-        cdt2 = (c * self.dt)**2
-        errors = []
-        snapshots = {}
+    def __call__(self, N: int, Nt: int, cfl: float = 0.5, c: float = 1.0,
+                 mx: int = 3, my: int = 3, store_data: int = -1):
+        """
+        Solve the 2D wave equation with leapfrog.
+        - If store_data > 0: returns {timestep: solution}
+        - If store_data == -1: returns (h, l2_error_array)
+        """
+        self.cfl = cfl
+        self.c = c
+        self.Nt = Nt
 
-      
-        ue_fun = sp.lambdify((x, y, t), self.ue(mx, my), "numpy")
+       
+        self._initialize_state(N, mx, my)
 
-        for n in range(1, Nt+1):
-            
-            Uvec = self.U_n.flatten()
-            Lu = lap.dot(Uvec).reshape(self.N+1, self.N+1)
+        D = self.D
+        dt = self.dt
 
-            U_np1 = 2.0*self.U_n - self.U_nm1 + cdt2 * Lu
-
-            self.U_nm1, self.U_n = self.U_n, U_np1
-
-            self.apply_bcs()
-
-            if store_data > 0 and (n % store_data == 0):
-                snapshots[n] = self.U_n.copy()
-
-            if store_data == -1:
-                tn = n * self.dt
-                errors.append(self.l2_error(self.U_n, tn))
+        def laplacian(U: np.ndarray) -> np.ndarray:
+            return (D @ U + U @ D.T) / (self.h**2)
 
         if store_data > 0:
-            return snapshots
+            out = {0: self.u_prev.copy()}
         else:
-            return self.h, np.array(errors)
+            errs = [self.l2_error(self.u_prev, 0.0)]
 
-    def convergence_rates(self, m=4, cfl=0.1, Nt=10, mx=3, my=3):
-        E, h = [], []
-        N0 = 8
-        for _ in range(m):
-            dx, err = self(N0, Nt, cfl=cfl, mx=mx, my=my, store_data=-1)
-            E.append(err[-1])
-            h.append(dx)
-            N0 *= 2
-            Nt *= 2
-        r = [np.log(E[i-1]/E[i])/np.log(h[i-1]/h[i]) for i in range(1, m)]
-        return r, np.array(E), np.array(h)
+        # Leapfrog time stepping
+        for n in range(2, Nt + 1):
+            self.u_next[:] = 2 * self.u_now - self.u_prev + (self.c * dt)**2 * laplacian(self.u_now)
+            self.u_prev, self.u_now, self.u_next = self.u_now, self.u_next, self.u_prev
+            self.apply_bcs()
 
-# -------- Neumann variant --------
+            if store_data > 0:
+                if n % store_data == 0:
+                    out[n] = self.u_now.copy()
+            else:
+                tn = n * dt
+                errs.append(self.l2_error(self.u_now, tn))
+
+        return out if store_data > 0 else (self.h, np.array(errs))
+
+  
+    # Convergence
+   
+    def convergence_rates(self, m: int = 4, cfl: float = 0.1, Nt: int = 10,
+                          mx: int = 3, my: int = 3):
+        """
+        Refine grid & time together; report observed order, errors, mesh sizes.
+        """
+        errors = []
+        hs = []
+        N_coarse = 8
+        Nt_local = Nt
+
+        for i in range(m):
+            dx, err_hist = self(N_coarse, Nt_local, cfl=cfl, mx=mx, my=my, store_data=-1)
+            errors.append(err_hist[-1])
+            hs.append(dx)
+            N_coarse *= 2
+            Nt_local *= 2
+
+        orders = [np.log(errors[i - 1] / errors[i]) / np.log(hs[i - 1] / hs[i])
+                  for i in range(1, m)]
+        return orders, np.array(errors), np.array(hs)
+
+
 class Wave2D_Neumann(Wave2D):
-    def D2(self, N):
-        """Second derivative with homogeneous Neumann at boundaries."""
+    
 
-        n = N + 1
-        main = -2.0 * np.ones(n)
-        off  =  1.0 * np.ones(n - 1)
-        T = sparse.diags([off, main, off], [-1, 0, 1], format="lil")
-        
-        T[0, :] = 0.0;     T[0, 0] = -2.0; T[0, 1] = 2.0
-        T[-1, :] = 0.0;    T[-1, -1] = -2.0; T[-1, -2] = 2.0
-        return T.tocsr()
+    def second_diff_matrix(self, N: int) -> sparse.spmatrix:
+        # Standard interior stencil, with one-sided second derivative on boundaries
+        main = -2.0 * np.ones(N + 1)
+        off = 1.0 * np.ones(N)
+        D = sparse.diags([off, main, off], offsets=[-1, 0, 1],
+                         shape=(N + 1, N + 1), format="lil")
+        # Neumann at i=0 and i=N: d^2/dx^2 with mirrored first-derivative
+        D[0, :] = 0.0
+        D[0, 0] = -2.0
+        D[0, 1] = 2.0
+        D[N, :] = 0.0
+        D[N, N] = -2.0
+        D[N, N - 1] = 2.0
+        return D
 
-    def ue(self, mx, my):
-        # Neumann standing wave
-        return sp.cos(mx*sp.pi*x) * sp.cos(my*sp.pi*y) * sp.cos(self.w*t)
+    def exact_mode(self, m_x: int, m_y: int) -> sp.Expr:
+        return sp.cos(m_x * sp.pi * x) * sp.cos(m_y * sp.pi * y) * sp.cos(self.omega * t)
 
-    def apply_bcs(self):
-        # For homogeneous Neumann, no values are imposed directly.
-        
-        pass
+    def apply_bcs(self) -> None:
+        # For homogeneous Neumann, the stencil takes care of boundary updates,
+        # so no explicit enforcement needed here.
+        return
+
+
+# Tests
+def test_convergence_wave2d():
+    sol = Wave2D()
+    r, E, h_vals = sol.convergence_rates(mx=2, my=3)
+    assert abs(r[-1] - 2) < 1e-2
+
+
+def test_convergence_wave2d_neumann():
+    solN = Wave2D_Neumann()
+    r, E, h_vals = solN.convergence_rates(mx=2, my=3)
+    assert abs(r[-1] - 2) < 0.05
+
+
+def test_exact_wave2d():
+    sol = Wave2D()
+    N = 64
+    Nt = 50
+    c = 1.0
+    cfl = 0.3
+    mx, my = 2, 3
+    h, errs = sol(N, Nt, cfl=cfl, c=c, mx=mx, my=my, store_data=-1)
+    dt = sol.dt
+
+    tol = 20.0 * (h**2 + dt**2)
+    print("\ntest_exact_wave2d() Result:")
+    print(f"errs[-1] = {errs[-1]:.2g}")
+    assert errs[-1] < tol, f"L2 error {errs[-1]:.3e} not below tolerance {tol:.3e}"
